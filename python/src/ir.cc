@@ -1662,6 +1662,25 @@ void init_triton_ir(py::module_ &m) {
              return self.create<AtomicPollOp>(
                  ptr, expected, timeout.value_or(Value()), sem, scope);
            })
+      .def("create_atomic_load",
+           [](TritonOpBuilder &self, Value &ptr, std::optional<Value> mask,
+              std::optional<Value> other, MemSemantic sem,
+              MemSyncScope scope) -> Value {
+             Type dstType;
+             if (auto srcTensorType =
+                     dyn_cast<RankedTensorType>(ptr.getType())) {
+               Type dstElemType =
+                   cast<PointerType>(srcTensorType.getElementType())
+                       .getPointeeType();
+               dstType = srcTensorType.clone(dstElemType);
+             } else {
+               auto ptrType = cast<PointerType>(getElementTypeOrSelf(ptr));
+               dstType = ptrType.getPointeeType();
+             }
+             return self.create<AtomicLoadOp>(
+                 dstType, ptr, mask.value_or(Value()), other.value_or(Value()),
+                 sem, scope);
+           })
       .def("create_atomic_cas",
            [](TritonOpBuilder &self, Value &ptr, Value &cmp, Value &val,
               MemSemantic sem, MemSyncScope scope) -> Value {

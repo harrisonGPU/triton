@@ -50,6 +50,7 @@ from .core import (
     atomic_poll,
     atomic_xchg,
     atomic_xor,
+    atomic_load,
     bfloat16,
     block_type,
     broadcast,

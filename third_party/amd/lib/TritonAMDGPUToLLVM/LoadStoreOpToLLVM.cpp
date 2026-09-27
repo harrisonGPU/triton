@@ -2251,6 +2251,141 @@ struct AtomicCASOpConversion
   }
 };
 
+struct AtomicLoadOpConversion
+    : public ConvertOpToLLVMPattern<triton::AtomicLoadOp>,
+      public LoadStoreConversionBase {
+  AtomicLoadOpConversion(LLVMTypeConverter &converter,
+                        const AMD::TargetInfo &targetInfo,
+                        ModuleAxisInfoAnalysis &axisAnalysisPass,
+                        PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(converter, benefit),
+        LoadStoreConversionBase(targetInfo, axisAnalysisPass) {}
+
+  LogicalResult
+  matchAndRewrite(triton::AtomicLoadOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    MLIRContext *ctx = rewriter.getContext();
+
+    Value llPtr = adaptor.getPtr();
+    Value llMask = adaptor.getMask();
+    Value llOther = adaptor.getOther();
+
+    auto ptrElements =
+        unpackTensorElements(loc, llPtr, rewriter, op.getPtr().getType());
+    SmallVector<Value> maskElements, otherElements;
+    if (llMask)
+      maskElements =
+          unpackTensorElements(loc, llMask, rewriter, op.getMask().getType());
+    if (llOther)
+      otherElements =
+          unpackTensorElements(loc, llOther, rewriter, op.getOther().getType());
+
+    auto atomicMemOrdering = getMemoryOrdering(op.getSem());
+    if (!atomicMemOrdering)
+      return rewriter.notifyMatchFailure(op, "Unknown AMDGPU memory ordering");
+    auto scope = getAMDGPUMemScopeStr(op.getScope());
+    if (!scope)
+      return rewriter.notifyMatchFailure(op, "Unknown AMDGPU memory scope");
+    StringRef scopeStr(scope.value());
+
+    auto valueTy = op.getResult().getType();
+    auto tensorTy = dyn_cast<RankedTensorType>(valueTy);
+    Type valueElemTy =
+        tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
+                 : valueTy;
+    auto elemsPerThread = getTotalElemsPerThread(op.getPtr().getType());
+    SmallVector<Value> resultVals(elemsPerThread);
+
+    auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
+    Value threadPred = emitRedundantThreadPredicateNonNull(
+        freeVarMasks, rewriter, loc, targetInfo);
+    uint32_t regMask = freeVarMasks[str_attr("reg")];
+
+    for (size_t i = 0; i < elemsPerThread; i += 1) {
+      if (tensorTy && (i & ~regMask) != i) {
+        resultVals[i] = resultVals[i & ~regMask];
+        continue;
+      }
+
+      Value loadPtr = ptrElements[i];
+      Value elemPred =
+          llMask ? b.and_(threadPred, maskElements[i]) : threadPred;
+
+      if (tensorTy) {
+        Value undefVal = b.undef(valueElemTy);
+        auto *curBlock = rewriter.getInsertionBlock();
+        auto *endBlock = curBlock->splitBlock(rewriter.getInsertionPoint());
+        auto *loadBlock = rewriter.createBlock(
+            curBlock->getParent(), std::next(Region::iterator(curBlock)));
+        endBlock->addArgument({valueElemTy}, {loc});
+
+        rewriter.setInsertionPointToEnd(curBlock);
+        LLVM::CondBrOp::create(rewriter, loc, elemPred, loadBlock, endBlock,
+                               undefVal);
+
+        rewriter.setInsertionPointToStart(loadBlock);
+        Value loaded = LLVM::LoadOp::create(
+            rewriter, loc, valueElemTy, loadPtr,
+            valueElemTy.getIntOrFloatBitWidth() / 8,
+            /*isVolatile=*/false, /*isNonTemporal=*/false,
+            /*isInvariant=*/false, /*isInvariantGroup=*/false,
+            *atomicMemOrdering, scopeStr);
+        LLVM::BrOp::create(rewriter, loc, loaded, endBlock);
+
+        rewriter.setInsertionPointToStart(endBlock);
+        Value ret = endBlock->getArgument(0);
+        if (llMask && !otherElements.empty())
+          ret = b.select(maskElements[i], ret, otherElements[i]);
+        resultVals[i] = ret;
+      } else {
+        auto *curBlock = rewriter.getInsertionBlock();
+        auto *endBlock = curBlock->splitBlock(rewriter.getInsertionPoint());
+        auto *loadBlock = rewriter.createBlock(
+            curBlock->getParent(), std::next(Region::iterator(curBlock)));
+
+        rewriter.setInsertionPointToEnd(curBlock);
+        LLVM::CondBrOp::create(rewriter, loc, elemPred, loadBlock, endBlock);
+
+        rewriter.setInsertionPointToStart(loadBlock);
+        Value loaded = LLVM::LoadOp::create(
+            rewriter, loc, valueElemTy, loadPtr,
+            valueElemTy.getIntOrFloatBitWidth() / 8,
+            /*isVolatile=*/false, /*isNonTemporal=*/false,
+            /*isInvariant=*/false, /*isInvariantGroup=*/false,
+            *atomicMemOrdering, scopeStr);
+
+        if (!op.getResult().use_empty()) {
+          Value atomPtr =
+              getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
+          b.store(loaded, atomPtr);
+        }
+
+        LLVM::BrOp::create(rewriter, loc, ValueRange(), endBlock);
+
+        rewriter.setInsertionPointToStart(endBlock);
+
+        if (op.getResult().use_empty()) {
+          rewriter.eraseOp(op);
+          return success();
+        }
+
+        b.barrier(triton::gpu::AddrSpace::Local);
+        Value atomPtr =
+            getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
+        Value ret = b.load(valueElemTy, atomPtr);
+        rewriter.replaceOp(op, {ret});
+        return success();
+      }
+    }
+
+    finalizeTensorAtomicResults(op, tensorTy, rewriter, resultVals, valueElemTy,
+                                b, threadPred, targetInfo, getTypeConverter());
+    return success();
+  }
+};
+
 bool supportsGlobalAtomicF16PackedAndDpp(ISAFamily isaFamily) {
   switch (isaFamily) {
   case ISAFamily::CDNA1:
@@ -2656,16 +2791,17 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        RewritePatternSet &patterns,
                                        ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                        PatternBenefit benefit) {
-  patterns.add<AtomicCASOpConversion, AtomicRMWOpConversion, LoadOpConversion,
-               StoreOpConversion, BufferLoadOpConversion,
-               BufferLoadToLocalOpConversion, BufferStoreOpConversion,
-               BufferAtomicRMWOpConversion, AsyncCopyGlobalToLocalOpConversion,
-               AsyncCopyLocalToGlobalOpConversion, BufferAtomicCASOpConversion,
-               AsyncTDMCopyGlobalToLocalOpConversion,
-               AsyncTDMFusedCopyGlobalToLocalOpConversion,
-               AsyncTDMCopyLocalToGlobalOpConversion,
-               AsyncTDMScatterOpConversion, AsyncTDMGatherOpConversion>(
-      typeConverter, targetInfo, axisInfoAnalysis, benefit);
+  patterns
+      .add<AtomicCASOpConversion, AtomicLoadOpConversion, AtomicRMWOpConversion,
+           LoadOpConversion, StoreOpConversion, BufferLoadOpConversion,
+           BufferLoadToLocalOpConversion, BufferStoreOpConversion,
+           BufferAtomicRMWOpConversion, AsyncCopyGlobalToLocalOpConversion,
+           AsyncCopyLocalToGlobalOpConversion, BufferAtomicCASOpConversion,
+           AsyncTDMCopyGlobalToLocalOpConversion,
+           AsyncTDMFusedCopyGlobalToLocalOpConversion,
+           AsyncTDMCopyLocalToGlobalOpConversion, AsyncTDMScatterOpConversion,
+           AsyncTDMGatherOpConversion>(typeConverter, targetInfo,
+                                       axisInfoAnalysis, benefit);
   patterns.add<TTGAsyncWaitOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<AsyncWaitOpConversion>(typeConverter, targetInfo, benefit);
   patterns.add<TDMPrefetchConversion>(typeConverter, targetInfo, benefit);

@@ -514,6 +514,91 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
   int computeCapability;
 };
 
+struct AtomicLoadOpConversion
+    : public ConvertOpToLLVMPattern<triton::AtomicLoadOp>,
+      public LoadStoreConversionBase {
+  AtomicLoadOpConversion(LLVMTypeConverter &converter,
+                        const NVIDIA::TargetInfo &targetInfo,
+                        ModuleAxisInfoAnalysis &axisAnalysisPass,
+                        PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::AtomicLoadOp>(converter, benefit),
+        LoadStoreConversionBase(targetInfo, axisAnalysisPass) {}
+
+  LogicalResult
+  matchAndRewrite(triton::AtomicLoadOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+
+    Value llPtr = adaptor.getPtr();
+    Value llMask = adaptor.getMask();
+    Value llOther = adaptor.getOther();
+
+    auto ptrElements = unpackUniqueTensorElements(loc, llPtr, rewriter);
+    SmallVector<Value> maskElements, otherElements;
+    if (llMask)
+      maskElements = unpackUniqueTensorElements(loc, llMask, rewriter);
+    if (llOther)
+      otherElements = unpackUniqueTensorElements(loc, llOther, rewriter);
+
+    auto valueTy = op.getType();
+    auto tensorTy = dyn_cast<RankedTensorType>(valueTy);
+    Type valueElemTy =
+        tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
+                 : getTypeConverter()->convertType(valueTy);
+    auto elemsPerThread = getUniqueElemsPerThread(op.getPtr().getType());
+
+    auto freeVarMasks = getFreeVariableMasks(op.getPtr().getType());
+    Value threadPred = ttg::emitRedundantThreadPredicate(freeVarMasks, rewriter,
+                                                         loc, targetInfo);
+
+    std::unordered_map<triton::MemSyncScope, triton::nvgpu::MemSyncScope>
+        ScopeMap = {
+            {triton::MemSyncScope::CTA, triton::nvgpu::MemSyncScope::CTA},
+            {triton::MemSyncScope::GPU, triton::nvgpu::MemSyncScope::GPU},
+            {triton::MemSyncScope::SYSTEM,
+             triton::nvgpu::MemSyncScope::SYSTEM}};
+    if (!ScopeMap.count(op.getScope()))
+      return rewriter.notifyMatchFailure(op, "unsupported sync scope");
+
+    SmallVector<Value> resultVals(elemsPerThread);
+    for (size_t i = 0; i < elemsPerThread; ++i) {
+      Value ptrElem = ptrElements[i];
+      Value maskVal = llMask ? maskElements[i] : Value();
+      Value pred =
+          llMask ? ttg::maybeAnd(rewriter, loc, threadPred, maskVal) : threadPred;
+
+      auto loadAcquireOp = triton::nvgpu::LoadAcquireOp::create(
+          rewriter, loc, valueElemTy, ptrElem, pred,
+          op.getSem() == triton::MemSemantic::ACQUIRE
+              ? triton::nvgpu::MemSemantic::ACQUIRE
+              : triton::nvgpu::MemSemantic::RELAXED,
+          ScopeMap[op.getScope()]);
+
+      Value loaded = loadAcquireOp.getResult();
+      if (maskVal && !otherElements.empty())
+        loaded = b.select(maskVal, loaded, otherElements[i]);
+
+      if (tensorTy) {
+        resultVals[i] = loaded;
+      } else {
+        if (op.getResult().use_empty()) {
+          rewriter.eraseOp(op);
+          return success();
+        }
+        Value ret = broadcastScalarAtomicResult(op, valueElemTy, loaded,
+                                                rewriter, b, pred, targetInfo);
+        rewriter.replaceOp(op, {ret});
+        return success();
+      }
+    }
+
+    finalizeTensorAtomicResults(op, tensorTy, rewriter, resultVals, valueElemTy,
+                                b, threadPred, targetInfo, getTypeConverter());
+    return success();
+  }
+};
+
 struct AtomicCASOpConversion
     : public ConvertOpToLLVMPattern<triton::AtomicCASOp>,
       public LoadStoreConversionBase {
@@ -1830,8 +1915,8 @@ void mlir::triton::NVIDIA::populateLoadStoreOpToLLVMPatterns(
     int computeCapability, RewritePatternSet &patterns,
     ModuleAxisInfoAnalysis &axisInfoAnalysis, PatternBenefit benefit) {
   patterns.add<AsyncCopyGlobalToLocalOpConversion, AtomicCASOpConversion,
-               AtomicRMWOpConversion>(typeConverter, targetInfo,
-                                      axisInfoAnalysis, benefit);
+               AtomicLoadOpConversion, AtomicRMWOpConversion>(
+      typeConverter, targetInfo, axisInfoAnalysis, benefit);
   patterns.add<LoadOpConversion, StoreOpConversion>(
       typeConverter, targetInfo, computeCapability, axisInfoAnalysis, benefit);
   patterns.add<AsyncCommitGroupOpConversion, AsyncWaitOpConversion,

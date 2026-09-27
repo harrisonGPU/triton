@@ -16,6 +16,22 @@ tt.func @atomic_poll_invalid_width(%ptr: tensor<32x!tt.ptr<i8>>, %expected: tens
 
 // -----
 
+tt.func @atomic_load_invalid_sem(%ptr: !tt.ptr<i32>) {
+  // expected-error @+1 {{only supports acquire and relaxed semantics}}
+  %v = tt.atomic_load release, gpu, %ptr : (!tt.ptr<i32>) -> i32
+  tt.return
+}
+
+// -----
+
+tt.func @atomic_load_invalid_width(%ptr: !tt.ptr<i8>) {
+  // expected-error @+1 {{only supports integer or floating point elements with width}}
+  %v = tt.atomic_load acquire, gpu, %ptr : (!tt.ptr<i8>) -> i8
+  tt.return
+}
+
+// -----
+
 tt.func @fn(%v: i32) {
   %b = tt.splat %v : i32 -> tensor<128xi32>
   // expected-error @+1 {{rank of source must be same as rank of result}}

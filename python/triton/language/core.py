@@ -2564,6 +2564,30 @@ def _add_atomic_docstr(name: str, has_cmp: bool = False) -> Callable[[T], T]:
 
     return _decorator
 
+@_tensor_member_fn
+@builtin
+def atomic_load(pointer, mask=None, other=None, sem=None, scope=None, _semantic=None):
+    """
+    Atomically load the value at :code:`pointer`.
+
+    :param pointer: A pointer, or block of pointers, to 16-, 32-, or 64-bit integers.
+    :type pointer: triton.PointerDType
+    :param mask: Only load elements where mask is true.
+    :type mask: Block of triton.int1, optional
+    :param other: Value to use for masked-off elements instead of the loaded value.
+    :type other: pointer.dtype.element_ty, optional
+    :param sem: Specifies the memory semantics. Acceptable values are
+        "acquire" (default) and "relaxed".
+    :type sem: str, optional
+    :param scope: Defines the scope of threads that observe the synchronizing
+        effect. Acceptable values are "gpu" (default), "cta", and "sys".
+    :type scope: str, optional
+    """
+    mask = _unwrap_if_constexpr(mask)
+    other = _unwrap_if_constexpr(other)
+    sem = _unwrap_if_constexpr(sem)
+    scope = _unwrap_if_constexpr(scope)
+    return _semantic.atomic_load(pointer, mask, other, sem, scope)
 
 @_tensor_member_fn
 @builtin

@@ -1279,6 +1279,49 @@ class TritonSemantic(Generic[TensorTy]):
             raise ValueError("atomic_cas only supports elements with width {16, 32, 64}")
         return self.tensor(self.builder.create_atomic_cas(ptr.handle, cmp.handle, val.handle, sem, scope), val.type)
 
+    def atomic_load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], sem: str,
+                    scope: str) -> TensorTy:
+        if not ptr.type.scalar.is_ptr():
+            raise ValueError(f"Unsupported ptr type {ptr.type.__repr__()} in `tl.atomic_load`")
+        if mask is None and other is not None:
+            raise ValueError("`other` cannot be provided without `mask`")
+
+        element_ty = ptr.type.scalar.element_ty
+        if element_ty.primitive_bitwidth not in [16, 32, 64]:
+            raise ValueError("atomic_load only supports elements with width {16, 32, 64}")
+
+        # For a pointer of scalar, check the type of `mask` and `other`
+        if not ptr.type.is_block():
+            if mask and mask.type.is_block():
+                raise ValueError("Mask argument cannot be block type if pointer argument is not a block")
+            if other and other.type.is_block():
+                raise ValueError("Other argument cannot be block type if pointer argument is not a block")
+
+        # Make `mask` and `other` into the same shape as `ptr`
+        if ptr.type.is_block():
+            if mask is not None:
+                ptr, mask = self.broadcast_impl_value(ptr, mask)
+            if other is not None:
+                ptr, other = self.broadcast_impl_value(ptr, other)
+
+        if other is not None:
+            other = self.cast(other, element_ty)
+
+        sem = self._str_to_sem(sem, default=ir.MEM_SEMANTIC.ACQUIRE)
+        if sem not in [ir.MEM_SEMANTIC.ACQUIRE, ir.MEM_SEMANTIC.RELAXED]:
+            raise ValueError("atomic_load only supports acquire and relaxed semantics")
+        scope = self._str_to_scope(scope)
+
+        dst_ty = ptr.type.with_element_ty(element_ty) if ptr.type.is_block() else element_ty
+        handle = self.builder.create_atomic_load(
+            ptr.handle,
+            mask.handle if mask is not None else ir.value(),
+            other.handle if other is not None else ir.value(),
+            sem,
+            scope,
+        )
+        return self.tensor(handle, dst_ty)
+
     def atom_red_typechecking_impl(self, ptr: TensorTy, val: TensorTy, mask: TensorTy,
                                    op: str) -> Tuple[TensorTy, TensorTy, TensorTy]:
         if not ptr.type.scalar.is_ptr():

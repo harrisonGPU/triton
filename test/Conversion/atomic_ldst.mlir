@@ -27,6 +27,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 
+  // CHECK-TTG2NVGPU-LABEL: @atomic_load
+  // CHECK-TTG2NVGPU: nvg.ld_acquire acquire, gpu
+  // CHECK-NVGPU2LLVM-LABEL: @atomic_load
+  // CHECK-NVGPU2LLVM: ld.global.gpu.acquire.b32
+  tt.func public @atomic_load(%arg0: !tt.ptr<i32> {tt.divisibility = 16 : i32}) {
+    %0 = tt.atomic_load acquire, gpu, %arg0 : (!tt.ptr<i32>) -> i32
+    tt.store %arg0, %0 : !tt.ptr<i32>
+    tt.return
+  }
+
   // CHECK-POLL-LABEL: @atomic_poll
   // CHECK-POLL: nvvm.read.ptx.sreg.tid.x
   // CHECK-POLL: %[[START:.*]] = llvm.call_intrinsic "llvm.nvvm.read.ptx.sreg.globaltimer"() : () -> i64

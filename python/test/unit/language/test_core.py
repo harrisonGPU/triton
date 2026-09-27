@@ -1683,6 +1683,56 @@ def test_atomic_poll_waits_for_remote_cta(device):
 
 
 @pytest.mark.interpreter
+@pytest.mark.parametrize("sem", ["relaxed", "acquire"])
+@pytest.mark.parametrize("scope", ["cta", "gpu", "sys"])
+@pytest.mark.parametrize("dtype, bit_width", [(torch.int16, 16), (torch.int32, 32), (torch.int64, 64)])
+def test_atomic_load(dtype, bit_width, sem, scope, device):
+
+    @triton.jit
+    def kernel(ptr, out, SEM: tl.constexpr, SCOPE: tl.constexpr):
+        v = tl.atomic_load(ptr, sem=SEM, scope=SCOPE)
+        tl.store(out, v)
+
+    x = torch.full((1, ), 42, dtype=dtype, device=device)
+    out = torch.zeros_like(x)
+    compiled = kernel[(1, )](x, out, SEM=sem, SCOPE=scope, num_warps=4)
+
+    assert out.item() == 42
+    if is_cuda() and sem == "acquire":
+        ptx = compiled.asm["ptx"]
+        assert ptx.count(f"ld.global.{scope}.acquire.b{bit_width}") == 1
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("block_size", [1, 16, 128])
+def test_atomic_load_masked(block_size, device):
+
+    @triton.jit
+    def kernel(ptr, out, other, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets % 2 == 0
+        v = tl.atomic_load(ptr + offsets, mask=mask, other=other, sem="relaxed")
+        tl.store(out + offsets, v)
+
+    x = torch.arange(block_size, dtype=torch.int32, device=device)
+    out = torch.full((block_size, ), -1, dtype=torch.int32, device=device)
+    kernel[(1, )](x, out, -1, BLOCK=block_size)
+
+    expected = torch.where(torch.arange(block_size, device=device) % 2 == 0, x, torch.full_like(x, -1))
+    assert torch.equal(out, expected)
+
+
+def test_atomic_load_invalid_sem(device):
+
+    @triton.jit
+    def kernel(ptr):
+        tl.atomic_load(ptr, sem="release")
+
+    x = torch.zeros((1, ), dtype=torch.int32, device=device)
+    with pytest.raises(Exception, match="atomic_load only supports acquire and relaxed semantics"):
+        kernel[(1, )](x)
+
+@pytest.mark.interpreter
 @pytest.mark.parametrize(
     "op, dtype_x_str, mode, sem",
     list(

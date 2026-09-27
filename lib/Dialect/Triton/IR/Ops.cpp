@@ -148,6 +148,31 @@ struct CanonicalizeMaskedStorePattern : public OpRewritePattern<StoreOp> {
   }
 };
 
+Value AtomicLoadOp::getPredicateOperand() { return getMask(); }
+
+void AtomicLoadOp::setPredicateOperand(Value pred) {
+  getMaskMutable().assign(pred);
+}
+
+Type AtomicLoadOp::getPredicateOperandTypeLike() { return getPtr().getType(); }
+
+LogicalResult AtomicLoadOp::verify() {
+  if (getSem() != MemSemantic::ACQUIRE && getSem() != MemSemantic::RELAXED)
+    return emitOpError("only supports acquire and relaxed semantics");
+
+  Type elemTy = getElementTypeOrSelf(getResult().getType());
+  if (!elemTy.isIntOrFloat())
+    return emitOpError("only supports integer or floating point elements");
+
+  unsigned bitWidth = elemTy.getIntOrFloatBitWidth();
+  if (bitWidth != 16 && bitWidth != 32 && bitWidth != 64)
+    return emitOpError(
+        "only supports integer or floating point elements with width {16, "
+        "32, 64}");
+
+  return success();
+}
+
 Value AtomicRMWOp::getPredicateOperand() { return getMask(); }
 
 void AtomicRMWOp::setPredicateOperand(Value pred) {

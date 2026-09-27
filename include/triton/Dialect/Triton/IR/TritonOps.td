@@ -367,6 +367,44 @@ def TT_AtomicPollOp : TT_Op<"atomic_poll", [
     let hasVerifier = 1;
 }
 
+def TT_AtomicLoadOp : TT_Op<"atomic_load", [
+  AtomicOpInterface,
+  SameOperandsAndResultShape,
+  SameOperandsAndResultEncoding,
+  AttrSizedOperandSegments,
+  DeclareOpInterfaceMethods<PredicatedOpInterface>,
+]> {
+  let summary = "atomic load";
+
+  let description = [{
+    Atomically load the value at $ptr with the given memory semantics and
+    scope. It only reads memory and never writes a new value back.
+    Only acquire and relaxed semantics are supported. The element type must
+    be an integer or floating point type with width 16, 32, or 64.
+
+    Elements where $mask is false are not loaded, so their addresses need
+    not be valid; $other, if provided, supplies their result value,
+    otherwise it is unspecified. $other requires $mask to be present.
+  }];
+
+  let arguments = (ins
+    Arg<TT_PtrLike, "", [MemRead<GlobalMemory>]>:$ptr,
+    Optional<TT_BoolLike>:$mask,
+    Optional<TT_Type>:$other,
+    TT_MemSemanticAttr:$sem,
+    TT_MemSyncScopeAttr:$scope
+  );
+
+  let results = (outs TT_Type:$result);
+
+  let assemblyFormat = [{
+    $sem `,` $scope `,` $ptr (`,` $mask^)? (`,` $other^)? attr-dict `:`
+    functional-type(operands, $result)
+  }];
+
+  let hasVerifier = 1;
+}
+
 def TT_AtomicRMWOp : TT_Op<"atomic_rmw", [
   AtomicOpInterface,
   SameOperandsAndResultShape,
